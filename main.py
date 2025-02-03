@@ -108,8 +108,15 @@ def process_file(file_path: str) -> str:
     return ""
 
 def get_embedding(text: str) -> List[float]:
-    response = openai.Embedding.create(input=[text], model="text-embedding-ada-002")
-    return response["data"][0]["embedding"]
+    """Generates an embedding for the given text using OpenAI's updated API."""
+    try:
+        client = openai.OpenAI()  # Initialize the OpenAI client
+        response = client.embeddings.create(input=[text], model="text-embedding-ada-002")
+        embedding = response.data[0].embedding
+        return embedding
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error generating embedding: {e}")
+
 
 def index_documents(file_infos: List[Dict]) -> None:
     vectors = []
