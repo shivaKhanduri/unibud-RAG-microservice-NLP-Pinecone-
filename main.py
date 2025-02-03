@@ -261,12 +261,16 @@ async def ask_question(query: QueryRequest):
             return {
                 "answer": "I'm sorry, but I couldn't find any relevant information to answer your question.",
                 "sources": [],
+                "highlighted_context": "",
                 "processing_time": processing_time,
                 "token_usage": {}
             }
 
         # Build context from Pinecone matches
-        context = "\n".join([match.metadata.get("text", "") for match in response.matches])
+        context_chunks = [match.metadata.get("text", "").strip() for match in response.matches]
+        context = "\n".join(context_chunks)
+        # Wrap each chunk in <mark> tags for highlighting
+        highlighted_context = "\n".join([f"<mark>{chunk}</mark>" for chunk in context_chunks])
         
         system_prompt = (
             "You are a knowledgeable teaching assistant. Provide a detailed, step-by-step explanation using ONLY the context below. "
@@ -297,6 +301,8 @@ async def ask_question(query: QueryRequest):
         return {
             "answer": answer,
             "sources": sources[:2],
+            "context": context,
+            "highlighted_context": highlighted_context,
             "processing_time": processing_time,
             "token_usage": dict(completion.get("usage", {}))
         }
