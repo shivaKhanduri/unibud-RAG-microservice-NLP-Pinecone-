@@ -227,3 +227,11 @@ async def ask_question(query: QueryRequest):
 @app.get("/health")
 def health_check():
     return {"status": "healthy"}
+
+@app.get("/")
+def read_root():
+    return {"message": "Welcome to the UniBud API! Use /upload to upload files or /ask to query."}
+
+@app.get("/health")
+def health_check():
+    return {"status": "healthy"}
