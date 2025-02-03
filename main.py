@@ -31,11 +31,11 @@ app.add_middleware(
 # -----------------------------------------------------------------------------------
 # Environment Configuration
 # -----------------------------------------------------------------------------------
-# Load environment variables (configure these in your deployment environment)
+# Set OpenAI API key and Pinecone API key from environment variables
 openai.api_key = os.getenv("OPENAI_API_KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 
-# Firebase configuration
+# Firebase configuration (read JSON credentials from an environment variable)
 firebase_creds_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
 if firebase_creds_json:
     try:
@@ -55,7 +55,7 @@ pc = Pinecone(api_key=PINECONE_API_KEY)
 INDEX_NAME = "unibud-index"
 EMBEDDING_DIM = 1536
 
-# Create index if not exists
+# Create index if it does not exist
 if INDEX_NAME not in pc.list_indexes().names():
     pc.create_index(
         name=INDEX_NAME,
@@ -67,23 +67,26 @@ if INDEX_NAME not in pc.list_indexes().names():
 index = pc.Index(INDEX_NAME)
 
 # -----------------------------------------------------------------------------------
-# Helper Functions (Same as original with minor adjustments)
+# Helper Functions
 # -----------------------------------------------------------------------------------
 def upload_to_firebase(file_bytes: bytes, file_name: str, content_type: str) -> str:
-    """Uploads file bytes to Firebase Storage"""
+    """Uploads file bytes to Firebase Storage under the 'study_resources' folder."""
     blob = bucket.blob(f"study_resources/{file_name}")
     blob.upload_from_string(file_bytes, content_type=content_type)
     blob.make_public()
     return blob.public_url
 
 def chunk_text(text: str, max_length: int = 1000) -> List[str]:
+    """Splits text into chunks of a maximum length."""
     return [text[i:i + max_length] for i in range(0, len(text), max_length)]
 
 def extract_text_from_pdf(pdf_path: str) -> str:
+    """Extracts text from a PDF file using PyMuPDF."""
     doc = fitz.open(pdf_path)
     return "".join(page.get_text() for page in doc)
 
 def extract_text_from_ppt(ppt_path: str) -> str:
+    """Extracts text from a PPT/PPTX file and applies OCR to any images."""
     prs = Presentation(ppt_path)
     full_text = ""
     for slide in prs.slides:
@@ -100,6 +103,7 @@ def extract_text_from_ppt(ppt_path: str) -> str:
     return full_text
 
 def process_file(file_path: str) -> str:
+    """Determines file type by extension and extracts text accordingly."""
     ext = os.path.splitext(file_path)[1].lower()
     if ext == ".pdf":
         return extract_text_from_pdf(file_path)
@@ -110,26 +114,24 @@ def process_file(file_path: str) -> str:
 def get_embedding(text: str) -> List[float]:
     """Generates an embedding for the given text using OpenAI's updated API."""
     try:
-        client = openai.OpenAI()  # Initialize the OpenAI client
-        response = client.embeddings.create(input=[text], model="text-embedding-ada-002")
-        embedding = response.data[0].embedding
+        response = openai.Embedding.create(input=[text], model="text-embedding-ada-002")
+        embedding = response["data"][0]["embedding"]
         return embedding
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error generating embedding: {e}")
 
-
 def index_documents(file_infos: List[Dict]) -> None:
+    """Processes provided file infos, splits text into chunks, generates embeddings, and upserts to Pinecone."""
     vectors = []
     for file_info in file_infos:
         text = process_file(file_info["local_path"])
         if not text.strip():
             continue
-        
+
         chunks = chunk_text(text)
         for i, chunk in enumerate(chunks):
             vector_id = f"{os.path.basename(file_info['local_path'])}_{i}"
             embedding = get_embedding(chunk)
-            
             metadata = {
                 "source_file": os.path.basename(file_info["local_path"]),
                 "chunk_index": i,
@@ -137,8 +139,8 @@ def index_documents(file_infos: List[Dict]) -> None:
                 "file_url": file_info["firebase_url"]
             }
             vectors.append((vector_id, embedding, metadata))
-            time.sleep(0.2)
-    
+            time.sleep(0.2)  # To avoid rate limits
+
     if vectors:
         index.upsert(vectors=vectors)
 
@@ -153,62 +155,64 @@ async def upload_files(files: List[UploadFile] = File(...)):
     try:
         file_infos = []
         temp_paths = []
-        
+
         for uploaded_file in files:
             # Validate file type
             if not uploaded_file.filename.lower().endswith(('.pdf', '.ppt', '.pptx')):
                 raise HTTPException(400, detail="Invalid file type")
-            
+
             # Read file content
             content = await uploaded_file.read()
-            
+
             # Upload to Firebase
             firebase_url = upload_to_firebase(
                 content,
                 uploaded_file.filename,
                 uploaded_file.content_type
             )
-            
-            # Save to temp file
+
+            # Save to temporary file
             with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(uploaded_file.filename)[1]) as temp_file:
                 temp_file.write(content)
                 temp_path = temp_file.name
-            
+
             file_infos.append({
                 "local_path": temp_path,
                 "firebase_url": firebase_url
             })
             temp_paths.append(temp_path)
-        
-        # Index documents
+
+        # Index documents into Pinecone
         index_documents(file_infos)
-        
-        # Cleanup temp files
+
+        # Cleanup temporary files
         for path in temp_paths:
             os.unlink(path)
-        
+
         return {"message": f"Successfully processed {len(files)} files"}
-    
+
     except Exception as e:
         raise HTTPException(500, detail=str(e))
 
 @app.post("/ask")
 async def ask_question(query: QueryRequest):
     try:
-        # Process query
         query_text = query.query
         if not query_text:
             raise HTTPException(400, detail="Empty query")
-        
-        # Get embedding and query Pinecone
+
+        # Generate an embedding for the query and query Pinecone
         query_embedding = get_embedding(query_text)
         response = index.query(vector=query_embedding, top_k=5, include_metadata=True)
-        
-        # Generate answer with OpenAI
+
+        # Build context from Pinecone matches
         context = "\n".join([match.metadata["text"] for match in response.matches])
-        system_prompt = "You are a knowledgeable teaching assistant. Provide a detailed, step-by-step explanation using the context below."
+        system_prompt = (
+            "You are a knowledgeable teaching assistant. Provide a detailed, step-by-step explanation using the context below."
+        )
         user_prompt = f"Context:\n{context}\n\nQuestion: {query_text}"
-        
+
+        # Create a chat completion using the updated API (dictionary-style access)
         completion = openai.ChatCompletion.create(
             model="gpt-3.5-turbo",
             messages=[
@@ -218,16 +222,15 @@ async def ask_question(query: QueryRequest):
             temperature=0.2,
             max_tokens=1000
         )
-        
-        answer = completion.choices[0].message.content
+        answer = completion["choices"][0]["message"]["content"]
         sources = list({match.metadata["file_url"] for match in response.matches})
-        
+
         return {
             "answer": answer,
             "sources": sources[:2],  # Return top 2 sources
-            "token_usage": dict(completion.usage)
+            "token_usage": dict(completion["usage"])
         }
-    
+
     except Exception as e:
         raise HTTPException(500, detail=str(e))
 
@@ -238,7 +241,3 @@ def health_check():
 @app.get("/")
 def read_root():
     return {"message": "Welcome to the UniBud API! Use /upload to upload files or /ask to query."}
-
-@app.get("/health")
-def health_check():
-    return {"status": "healthy"}
