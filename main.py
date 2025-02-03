@@ -3,9 +3,9 @@ import io
 import json
 import time
 import tempfile
-from typing import List, Dict
+from typing import List, Dict, Tuple
 from urllib.parse import quote
-
+import spacy
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import openai
@@ -16,6 +16,8 @@ import pytesseract
 from google.cloud import storage
 from pinecone import Pinecone, ServerlessSpec
 from pydantic import BaseModel
+from sentence_transformers import CrossEncoder
+from tenacity import retry, wait_exponential, stop_after_attempt
 
 # Initialize FastAPI app
 app = FastAPI()
@@ -31,11 +33,15 @@ app.add_middleware(
 # -----------------------------------------------------------------------------------
 # Environment Configuration
 # -----------------------------------------------------------------------------------
+# Load NLP models
+nlp = spacy.load("en_core_web_sm")
+cross_encoder = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+
 # Set OpenAI API key and Pinecone API key from environment variables
 openai.api_key = os.getenv("OPENAI_API_KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 
-# Firebase configuration (read JSON credentials from an environment variable)
+# Firebase configuration
 firebase_creds_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
 if firebase_creds_json:
     try:
@@ -69,16 +75,25 @@ index = pc.Index(INDEX_NAME)
 # -----------------------------------------------------------------------------------
 # Helper Functions
 # -----------------------------------------------------------------------------------
+@retry(wait=wait_exponential(multiplier=1, min=4, max=10), stop=stop_after_attempt(3))
 def upload_to_firebase(file_bytes: bytes, file_name: str, content_type: str) -> str:
-    """Uploads file bytes to Firebase Storage under the 'study_resources' folder."""
+    """Uploads file bytes to Firebase Storage with retries."""
     blob = bucket.blob(f"study_resources/{file_name}")
     blob.upload_from_string(file_bytes, content_type=content_type)
     blob.make_public()
     return blob.public_url
 
-def chunk_text(text: str, max_length: int = 1000) -> List[str]:
-    """Splits text into chunks of a maximum length."""
-    return [text[i:i + max_length] for i in range(0, len(text), max_length)]
+def chunk_text(text: str, max_sentences: int = 5, overlap: int = 1) -> List[str]:
+    """Split text into chunks of sentences with overlap."""
+    doc = nlp(text)
+    sentences = [sent.text for sent in doc.sents]
+    chunks = []
+    start = 0
+    while start < len(sentences):
+        end = start + max_sentences
+        chunks.append(" ".join(sentences[start:end]))
+        start += (max_sentences - overlap)
+    return chunks
 
 def extract_text_from_pdf(pdf_path: str) -> str:
     """Extracts text from a PDF file using PyMuPDF."""
@@ -86,7 +101,7 @@ def extract_text_from_pdf(pdf_path: str) -> str:
     return "".join(page.get_text() for page in doc)
 
 def extract_text_from_ppt(ppt_path: str) -> str:
-    """Extracts text from a PPT/PPTX file and applies OCR to any images."""
+    """Extracts text from a PPT/PPTX file with OCR."""
     prs = Presentation(ppt_path)
     full_text = ""
     for slide in prs.slides:
@@ -103,7 +118,7 @@ def extract_text_from_ppt(ppt_path: str) -> str:
     return full_text
 
 def process_file(file_path: str) -> str:
-    """Determines file type by extension and extracts text accordingly."""
+    """Determines file type and extracts text."""
     ext = os.path.splitext(file_path)[1].lower()
     if ext == ".pdf":
         return extract_text_from_pdf(file_path)
@@ -111,38 +126,64 @@ def process_file(file_path: str) -> str:
         return extract_text_from_ppt(file_path)
     return ""
 
-def get_embedding(text: str) -> List[float]:
-    """Generates an embedding for the given text using OpenAI's updated API."""
+@retry(wait=wait_exponential(multiplier=1, min=1, max=5), stop=stop_after_attempt(3))
+def get_embeddings(texts: List[str]) -> List[List[float]]:
+    """Batch generate embeddings with exponential backoff."""
     try:
-        response = openai.Embedding.create(input=[text], model="text-embedding-ada-002")
-        embedding = response["data"][0]["embedding"]
-        return embedding
+        response = openai.Embedding.create(input=texts, model="text-embedding-ada-002")
+        return [item["embedding"] for item in response["data"]]
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error generating embedding: {e}")
+        raise HTTPException(500, detail=f"Embedding error: {e}")
+
+def extract_keywords(text: str) -> List[str]:
+    """Extract keywords using OpenAI."""
+    try:
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[{
+                "role": "system",
+                "content": "Extract 3-5 key concepts. Return as comma-separated list."
+            }, {
+                "role": "user",
+                "content": text
+            }],
+            temperature=0.0
+        )
+        return [kw.strip().lower() for kw in response.choices[0].message.content.split(",")]
+    except Exception:
+        return []
 
 def index_documents(file_infos: List[Dict]) -> None:
-    """Processes provided file infos, splits text into chunks, generates embeddings, and upserts to Pinecone."""
+    """Process and index documents with enhanced metadata."""
+    batch_size = 32
     vectors = []
+    
     for file_info in file_infos:
         text = process_file(file_info["local_path"])
         if not text.strip():
             continue
 
         chunks = chunk_text(text)
-        for i, chunk in enumerate(chunks):
-            vector_id = f"{os.path.basename(file_info['local_path'])}_{i}"
-            embedding = get_embedding(chunk)
-            metadata = {
-                "source_file": os.path.basename(file_info["local_path"]),
-                "chunk_index": i,
-                "text": chunk,
-                "file_url": file_info["firebase_url"]
-            }
-            vectors.append((vector_id, embedding, metadata))
-            time.sleep(0.2)  # To avoid rate limits
+        for batch_start in range(0, len(chunks), batch_size):
+            batch_chunks = chunks[batch_start:batch_start+batch_size]
+            embeddings = get_embeddings(batch_chunks)
+            
+            for i, (chunk, embedding) in enumerate(zip(batch_chunks, embeddings)):
+                vector_id = f"{os.path.basename(file_info['local_path'])}_{batch_start+i}"
+                metadata = {
+                    "source_file": os.path.basename(file_info["local_path"]),
+                    "text": chunk,
+                    "file_url": file_info["firebase_url"],
+                    "keywords": extract_keywords(chunk),
+                    "chunk_index": batch_start + i
+                }
+                vectors.append((vector_id, embedding, metadata))
+            time.sleep(0.5)  # Conservative rate limiting
 
     if vectors:
-        index.upsert(vectors=vectors)
+        # Batch upsert in chunks of 100
+        for i in range(0, len(vectors), 100):
+            index.upsert(vectors=vectors[i:i+100])
 
 # -----------------------------------------------------------------------------------
 # API Endpoints
@@ -157,35 +198,21 @@ async def upload_files(files: List[UploadFile] = File(...)):
         temp_paths = []
 
         for uploaded_file in files:
-            # Validate file type
             if not uploaded_file.filename.lower().endswith(('.pdf', '.ppt', '.pptx')):
                 raise HTTPException(400, detail="Invalid file type")
 
-            # Read file content
             content = await uploaded_file.read()
+            firebase_url = upload_to_firebase(content, uploaded_file.filename, uploaded_file.content_type)
 
-            # Upload to Firebase
-            firebase_url = upload_to_firebase(
-                content,
-                uploaded_file.filename,
-                uploaded_file.content_type
-            )
-
-            # Save to temporary file
             with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(uploaded_file.filename)[1]) as temp_file:
                 temp_file.write(content)
                 temp_path = temp_file.name
 
-            file_infos.append({
-                "local_path": temp_path,
-                "firebase_url": firebase_url
-            })
+            file_infos.append({"local_path": temp_path, "firebase_url": firebase_url})
             temp_paths.append(temp_path)
 
-        # Index documents into Pinecone
         index_documents(file_infos)
 
-        # Cleanup temporary files
         for path in temp_paths:
             os.unlink(path)
 
@@ -197,60 +224,68 @@ async def upload_files(files: List[UploadFile] = File(...)):
 @app.post("/ask")
 async def ask_question(query: QueryRequest):
     try:
-        query_text = query.query
-        if not query_text.strip():
+        query_text = query.query.strip()
+        if not query_text:
             raise HTTPException(400, detail="Empty query provided.")
 
-        # Generate an embedding for the query and query Pinecone
-        query_embedding = get_embedding(query_text)
-        response = index.query(vector=query_embedding, top_k=5, include_metadata=True)
+        # Get query embedding and keywords
+        query_embedding = get_embeddings([query_text])[0]
+        query_keywords = extract_keywords(query_text)
 
-        # Check if any relevant context was found
-        if not response.matches or all(not match.metadata.get("text", "").strip() for match in response.matches):
-            return {
-                "answer": "I'm sorry, but I couldn't find any relevant information to answer your question.",
-                "sources": [],
-                "token_usage": {}
-            }
-
-        # Build context from Pinecone matches
-        context = "\n".join([match.metadata.get("text", "") for match in response.matches])
-        
-        system_prompt = (
-            "You are a knowledgeable teaching assistant. Provide a detailed, step-by-step explanation using ONLY the context below. "
-            "If the context doesn't contain the answer, explicitly state that no relevant information was found."
+        # Enhanced Pinecone query with keyword filtering
+        response = index.query(
+            vector=query_embedding,
+            top_k=20,
+            filter={"keywords": {"$in": query_keywords}} if query_keywords else {},
+            include_metadata=True
         )
-        user_prompt = f"Context:\n{context}\n\nQuestion: {query_text}"
 
-        # Create a chat completion using OpenAI API
+        # Rerank with cross-encoder
+        matches = response.matches
+        if matches:
+            pairs = [(query_text, match.metadata["text"]) for match in matches]
+            scores = cross_encoder.predict(pairs)
+            reranked_matches = [match for _, match in sorted(zip(scores, matches), reverse=True)]
+        else:
+            reranked_matches = []
+
+        # Prepare context and sources
+        context_chunks = [match.metadata["text"] for match in reranked_matches[:5]]
+        seen_urls = set()
+        sources = []
+        
+        for match in reranked_matches:
+            url = match.metadata.get("file_url")
+            if url and url not in seen_urls:
+                seen_urls.add(url)
+                sources.append(url)
+            if len(sources) >= 3:
+                break
+
+        # Generate answer with improved prompt
+        system_prompt = f"""You are an academic assistant. Rules:
+1. Answer using ONLY this context: {" ".join(context_chunks)}
+2. If unsure, state "I couldn't find sufficient information."
+3. Cite sources like [1], [2] from: {", ".join(sources[:3]) or 'No sources'}"""
+        
         completion = openai.ChatCompletion.create(
             model="gpt-3.5-turbo",
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
+                {"role": "user", "content": query_text}
             ],
             temperature=0.2,
             max_tokens=1000
         )
-        
-        answer = completion["choices"][0]["message"]["content"]
-
-        # Collect sources with fallback if file_url is missing
-        sources = []
-        for match in response.matches:
-            file_url = match.metadata.get("file_url", "No file URL available")
-            sources.append(file_url)
 
         return {
-            "answer": answer,
-            "sources": sources[:2],  # Return top 2 sources
-            "token_usage": dict(completion["usage"])
+            "answer": completion.choices[0].message.content,
+            "sources": sources[:3],
+            "token_usage": completion.usage.dict()
         }
 
     except Exception as e:
-        raise HTTPException(500, detail=f"An error occurred while processing the query: {e}")
-
-
+        raise HTTPException(500, detail=f"Query processing error: {str(e)}")
 
 @app.get("/health")
 def health_check():
@@ -258,4 +293,4 @@ def health_check():
 
 @app.get("/")
 def read_root():
-    return {"message": "Welcome to the UniBud API! Use /upload to upload files or /ask to query."}
+    return {"message": "Enhanced UniBud API with intelligent retrieval"}
