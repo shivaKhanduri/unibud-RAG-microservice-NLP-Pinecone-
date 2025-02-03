@@ -206,13 +206,13 @@ async def ask_question(query: QueryRequest):
         response = index.query(vector=query_embedding, top_k=5, include_metadata=True)
 
         # Build context from Pinecone matches
-        context = "\n".join([match.metadata["text"] for match in response.matches])
+        context = "\n".join([match.metadata.get("text", "") for match in response.matches])
         system_prompt = (
             "You are a knowledgeable teaching assistant. Provide a detailed, step-by-step explanation using the context below."
         )
         user_prompt = f"Context:\n{context}\n\nQuestion: {query_text}"
 
-        # Create a chat completion using the updated API (dictionary-style access)
+        # Create a chat completion using OpenAI API
         completion = openai.ChatCompletion.create(
             model="gpt-3.5-turbo",
             messages=[
@@ -223,7 +223,12 @@ async def ask_question(query: QueryRequest):
             max_tokens=1000
         )
         answer = completion["choices"][0]["message"]["content"]
-        sources = list({match.metadata["file_url"] for match in response.matches})
+
+        # Handle missing file_url metadata gracefully
+        sources = []
+        for match in response.matches:
+            file_url = match.metadata.get("file_url", "No file URL available")
+            sources.append(file_url)
 
         return {
             "answer": answer,
@@ -233,6 +238,7 @@ async def ask_question(query: QueryRequest):
 
     except Exception as e:
         raise HTTPException(500, detail=str(e))
+
 
 @app.get("/health")
 def health_check():
