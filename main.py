@@ -198,17 +198,27 @@ async def upload_files(files: List[UploadFile] = File(...)):
 async def ask_question(query: QueryRequest):
     try:
         query_text = query.query
-        if not query_text:
-            raise HTTPException(400, detail="Empty query")
+        if not query_text.strip():
+            raise HTTPException(400, detail="Empty query provided.")
 
         # Generate an embedding for the query and query Pinecone
         query_embedding = get_embedding(query_text)
         response = index.query(vector=query_embedding, top_k=5, include_metadata=True)
 
+        # Check if any relevant context was found
+        if not response.matches or all(not match.metadata.get("text", "").strip() for match in response.matches):
+            return {
+                "answer": "I'm sorry, but I couldn't find any relevant information to answer your question.",
+                "sources": [],
+                "token_usage": {}
+            }
+
         # Build context from Pinecone matches
         context = "\n".join([match.metadata.get("text", "") for match in response.matches])
+        
         system_prompt = (
-            "You are a knowledgeable teaching assistant. Provide a detailed, step-by-step explanation using the context below."
+            "You are a knowledgeable teaching assistant. Provide a detailed, step-by-step explanation using ONLY the context below. "
+            "If the context doesn't contain the answer, explicitly state that no relevant information was found."
         )
         user_prompt = f"Context:\n{context}\n\nQuestion: {query_text}"
 
@@ -222,9 +232,10 @@ async def ask_question(query: QueryRequest):
             temperature=0.2,
             max_tokens=1000
         )
+        
         answer = completion["choices"][0]["message"]["content"]
 
-        # Handle missing file_url metadata gracefully
+        # Collect sources with fallback if file_url is missing
         sources = []
         for match in response.matches:
             file_url = match.metadata.get("file_url", "No file URL available")
@@ -237,7 +248,8 @@ async def ask_question(query: QueryRequest):
         }
 
     except Exception as e:
-        raise HTTPException(500, detail=str(e))
+        raise HTTPException(500, detail=f"An error occurred while processing the query: {e}")
+
 
 
 @app.get("/health")
