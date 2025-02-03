@@ -253,7 +253,12 @@ async def ask_question(query: QueryRequest):
 
         # Generate an embedding for the query and query Pinecone
         query_embedding = get_embedding(query_text)
-        response = index.query(vector=query_embedding, top_k=5, include_metadata=True)
+        # Increase top_k to get maximum results (here set to 10)
+        response = index.query(vector=query_embedding, top_k=10, include_metadata=True)
+
+        # Log the retrieved chunks for debugging
+        for match in response.matches:
+            logger.info(f"Retrieved chunk: {match.metadata.get('text', '').strip()}")
 
         # Check if any relevant context was found
         if not response.matches or all(not match.metadata.get("text", "").strip() for match in response.matches):
@@ -267,14 +272,15 @@ async def ask_question(query: QueryRequest):
             }
 
         # Build context from Pinecone matches
-        context_chunks = [match.metadata.get("text", "").strip() for match in response.matches]
+        context_chunks = [match.metadata.get("text", "").strip() for match in response.matches if match.metadata.get("text", "").strip()]
         context = "\n".join(context_chunks)
         # Wrap each chunk in <mark> tags for highlighting
         highlighted_context = "\n".join([f"<mark>{chunk}</mark>" for chunk in context_chunks])
         
+        # Updated system prompt to use ONLY the provided context
         system_prompt = (
-            "You are a knowledgeable teaching assistant. Provide a detailed, step-by-step explanation using ONLY the context below. "
-            "If the context doesn't contain the answer, explicitly state that no relevant information was found."
+            "You are a knowledgeable teaching assistant. Use ONLY the context provided below to answer the question. "
+            "Provide a detailed, step-by-step explanation. If the context does not contain the answer, explicitly state that no relevant information was found."
         )
         user_prompt = f"Context:\n{context}\n\nQuestion: {query_text}"
 
