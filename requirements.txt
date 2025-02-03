@@ -9,3 +9,4 @@ python-pptx
 pillow
 pytesseract
 python-dotenv
+numpy
