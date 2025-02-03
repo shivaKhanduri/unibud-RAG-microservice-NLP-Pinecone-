@@ -213,9 +213,20 @@ async def ask_question(query: QueryRequest):
                 "token_usage": {}
             }
 
-        # Build context from Pinecone matches
+        # Extract the top match (most relevant)
+        top_match = response.matches[0]
+        top_context = top_match.metadata.get("text", "")
+        top_source = top_match.metadata.get("file_url", "No file URL available")
+
+        # Extract other sources (somewhat relevant)
+        other_sources = [
+            match.metadata.get("file_url", "No file URL available")
+            for match in response.matches[1:]  # Skip the top match
+        ]
+
+        # Build the context for the AI to generate a response
         context = "\n".join([match.metadata.get("text", "") for match in response.matches])
-        
+
         system_prompt = (
             "You are a knowledgeable teaching assistant. Provide a detailed, step-by-step explanation using ONLY the context below. "
             "If the context doesn't contain the answer, explicitly state that no relevant information was found."
@@ -232,25 +243,18 @@ async def ask_question(query: QueryRequest):
             temperature=0.2,
             max_tokens=1000
         )
-        
-        answer = completion["choices"][0]["message"]["content"]
 
-        # Collect sources with fallback if file_url is missing
-        sources = []
-        for match in response.matches:
-            file_url = match.metadata.get("file_url", "No file URL available")
-            sources.append(file_url)
+        answer = completion["choices"][0]["message"]["content"]
 
         return {
             "answer": answer,
-            "sources": sources[:2],  # Return top 2 sources
+            "most_relevant_source": top_source,
+            "other_sources": other_sources,
             "token_usage": dict(completion["usage"])
         }
 
     except Exception as e:
         raise HTTPException(500, detail=f"An error occurred while processing the query: {e}")
-
-
 
 @app.get("/health")
 def health_check():
