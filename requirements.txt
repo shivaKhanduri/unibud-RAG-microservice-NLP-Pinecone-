@@ -1,0 +1,11 @@
+fastapi>=0.68.0
+uvicorn>=0.15.0
+python-multipart
+openai
+pinecone-client
+google-cloud-storage
+pymupdf
+python-pptx
+pillow
+pytesseract
+python-dotenv
