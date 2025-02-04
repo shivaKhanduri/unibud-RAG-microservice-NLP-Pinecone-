@@ -4,10 +4,10 @@ import json
 import time
 import tempfile
 import logging
-from typing import List, Dict
+from typing import List, Dict, Optional
 from urllib.parse import quote
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, Request, Response
+from fastapi import FastAPI, File, UploadFile, HTTPException, Request, Response, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import openai
@@ -54,7 +54,6 @@ app.add_middleware(
 # -----------------------------------------------------------------------------------
 # Environment Configuration
 # -----------------------------------------------------------------------------------
-# Set OpenAI API key and Pinecone API key from environment variables
 openai.api_key = os.getenv("OPENAI_API_KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 
@@ -70,10 +69,12 @@ if firebase_creds_json:
         raise Exception("Invalid JSON in GOOGLE_APPLICATION_CREDENTIALS_JSON")
 
 # Initialize Firebase storage client
+from google.cloud import storage
 storage_client = storage.Client()
 bucket = storage_client.bucket("unibud-22153.appspot.com")
 
 # Pinecone initialization
+from pinecone import Pinecone, ServerlessSpec
 pc = Pinecone(api_key=PINECONE_API_KEY)
 INDEX_NAME = "unibud-index"
 EMBEDDING_DIM = 1536
@@ -173,12 +174,15 @@ def index_documents(file_infos: List[Dict]) -> None:
             embeddings = get_embeddings(chunks)
             for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
                 vector_id = f"{os.path.basename(file_info['local_path'])}_{i}"
+                # Merge system generated metadata with user-provided metadata (if any)
                 metadata = {
                     "source_file": os.path.basename(file_info["local_path"]),
                     "chunk_index": i,
                     "text": chunk,
                     "file_url": file_info["firebase_url"]
                 }
+                if "user_metadata" in file_info:
+                    metadata.update(file_info["user_metadata"])
                 vectors.append((vector_id, embedding, metadata))
                 # Sleep a short time to avoid rate limits
                 time.sleep(0.2)
@@ -194,13 +198,26 @@ class QueryRequest(BaseModel):
     query: str
 
 @app.post("/upload")
-async def upload_files(files: List[UploadFile] = File(...)):
+async def upload_files(
+    files: List[UploadFile] = File(...),
+    metadata: Optional[str] = Form(None)  # Expecting a JSON string with metadata for each file
+):
     start_time = time.time()
     try:
         file_infos = []
         temp_paths = []
 
-        for uploaded_file in files:
+        # Parse the metadata JSON if provided
+        user_metadata_list = []
+        if metadata:
+            try:
+                user_metadata_list = json.loads(metadata)
+                if not isinstance(user_metadata_list, list):
+                    raise ValueError("Metadata should be a list of objects, one per file.")
+            except Exception as e:
+                raise HTTPException(400, detail=f"Invalid metadata JSON: {e}")
+
+        for idx, uploaded_file in enumerate(files):
             # Validate file type
             if not uploaded_file.filename.lower().endswith(('.pdf', '.ppt', '.pptx')):
                 raise HTTPException(400, detail="Invalid file type")
@@ -220,10 +237,14 @@ async def upload_files(files: List[UploadFile] = File(...)):
                 temp_file.write(content)
                 temp_path = temp_file.name
 
-            file_infos.append({
+            # Prepare the file info; attach user metadata for this file if provided
+            file_info = {
                 "local_path": temp_path,
                 "firebase_url": firebase_url
-            })
+            }
+            if idx < len(user_metadata_list):
+                file_info["user_metadata"] = user_metadata_list[idx]
+            file_infos.append(file_info)
             temp_paths.append(temp_path)
 
         # Index documents into Pinecone
@@ -277,14 +298,12 @@ async def ask_question(query: QueryRequest):
         # Wrap each chunk in <mark> tags for highlighting
         highlighted_context = "\n".join([f"<mark>{chunk}</mark>" for chunk in context_chunks])
         
-        # Updated system prompt to use ONLY the provided context
         system_prompt = (
             "You are a knowledgeable teaching assistant. Use ONLY the context provided below to answer the question. "
             "Provide a detailed, step-by-step explanation. If the context does not contain the answer, explicitly state that no relevant information was found."
         )
         user_prompt = f"Context:\n{context}\n\nQuestion: {query_text}"
 
-        # Create a chat completion using OpenAI API
         completion = openai.ChatCompletion.create(
             model="gpt-3.5-turbo",
             messages=[
@@ -297,7 +316,6 @@ async def ask_question(query: QueryRequest):
         
         answer = completion["choices"][0]["message"]["content"]
 
-        # Collect sources (returning top 2 sources)
         sources = []
         for match in response.matches:
             file_url = match.metadata.get("file_url", "No file URL available")
