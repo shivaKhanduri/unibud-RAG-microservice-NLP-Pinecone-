@@ -69,12 +69,10 @@ if firebase_creds_json:
         raise Exception("Invalid JSON in GOOGLE_APPLICATION_CREDENTIALS_JSON")
 
 # Initialize Firebase storage client
-from google.cloud import storage
 storage_client = storage.Client()
 bucket = storage_client.bucket("unibud-22153.appspot.com")
 
 # Pinecone initialization
-from pinecone import Pinecone, ServerlessSpec
 pc = Pinecone(api_key=PINECONE_API_KEY)
 INDEX_NAME = "unibud-index"
 EMBEDDING_DIM = 1536
@@ -115,9 +113,29 @@ def chunk_text(text: str, max_sentences: int = 5, overlap: int = 1) -> List[str]
     return chunks
 
 def extract_text_from_pdf(pdf_path: str) -> str:
-    """Extracts text from a PDF file using PyMuPDF."""
+    """
+    Extracts text from a PDF file using PyMuPDF.
+    For each page, if the embedded text is very short (suggesting it may be an image),
+    the page is rendered to an image and OCR is applied.
+    """
     doc = fitz.open(pdf_path)
-    return "".join(page.get_text() for page in doc)
+    full_text = ""
+    for page in doc:
+        # Try to extract embedded text first
+        text = page.get_text().strip()
+        # If the text is very short, perform OCR on the page
+        if len(text) < 20:
+            try:
+                pix = page.get_pixmap()
+                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                ocr_text = pytesseract.image_to_string(img)
+                full_text += ocr_text + "\n"
+            except Exception as e:
+                logger.warning(f"OCR error on page {page.number}: {e}")
+                full_text += "\n"
+        else:
+            full_text += text + "\n"
+    return full_text
 
 def extract_text_from_ppt(ppt_path: str) -> str:
     """Extracts text from a PPT/PPTX file and applies OCR to any images."""
@@ -134,7 +152,7 @@ def extract_text_from_ppt(ppt_path: str) -> str:
                     image = Image.open(image_stream)
                     full_text += pytesseract.image_to_string(image) + "\n"
                 except Exception as e:
-                    logger.warning(f"Error processing image OCR: {e}")
+                    logger.warning(f"Error processing image OCR in PPT: {e}")
     return full_text
 
 def process_file(file_path: str) -> str:
@@ -161,7 +179,10 @@ def get_embedding(text: str) -> List[float]:
     return embeddings[0]
 
 def index_documents(file_infos: List[Dict]) -> None:
-    """Processes provided file infos, splits text into chunks, generates embeddings, and upserts to Pinecone."""
+    """
+    Processes provided file infos, splits text into chunks, generates embeddings,
+    and upserts them into Pinecone.
+    """
     vectors = []
     for file_info in file_infos:
         text = process_file(file_info["local_path"])
