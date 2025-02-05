@@ -179,7 +179,7 @@ async def get_embeddings(texts: List[str]) -> List[List[float]]:
     try:
         async with httpx.AsyncClient() as client:
             response = await client.post(
-                "https://api.deepseek.com/v1/embeddings",
+                "https://api.deepseek.com/embeddings",
                 headers={
                     "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
                     "Content-Type": "application/json"
