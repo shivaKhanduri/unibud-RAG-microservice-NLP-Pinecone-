@@ -57,6 +57,7 @@ app.add_middleware(
 # -----------------------------------------------------------------------------------
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
+DEEPSEEK_BASE_URL = "https://api.deepseek.ai"
 
 # Firebase configuration
 firebase_creds_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
@@ -163,15 +164,12 @@ async def get_embeddings(texts: List[str]) -> List[List[float]]:
     try:
         async with httpx.AsyncClient() as client:
             response = await client.post(
-                "https://api.deepseek.com/v1/embeddings",  # Updated to include /v1
+                f"{DEEPSEEK_BASE_URL}/v1/embeddings",  # Updated URL
                 headers={
                     "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
                     "Content-Type": "application/json"
                 },
-                json={
-                    "input": texts,
-                    "model": "deepseek-embed"
-                },
+                json={"input": texts, "model": "text-embedding-002"},
                 timeout=30
             )
             response.raise_for_status()
@@ -219,17 +217,12 @@ async def deepseek_chat_completion(messages: List[Dict]) -> str:
     try:
         async with httpx.AsyncClient() as client:
             response = await client.post(
-                "https://api.deepseek.com/v1/chat/completions",  # Updated to include /v1
+                 f"{DEEPSEEK_BASE_URL}/v1/chat/completions",  # Updated URL # Updated to include /v1
                 headers={
                     "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
                     "Content-Type": "application/json"
                 },
-                json={
-                    "model": "deepseek-chat",
-                    "messages": messages,
-                    "temperature": 0.2,
-                    "max_tokens": 1000
-                },
+                 json={"model": "deepseek-chat-001", "messages": messages},  # Verify model
                 timeout=30
             )
             response.raise_for_status()
