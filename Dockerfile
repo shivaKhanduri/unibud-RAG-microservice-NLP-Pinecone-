@@ -1,7 +1,7 @@
 FROM python:3.9-slim
 
 # Install system dependencies (required for PyMuPDF, Tesseract, etc.)
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     tesseract-ocr \
     libtesseract-dev \
     gcc \
@@ -12,6 +12,10 @@ WORKDIR /app
 # Copy and install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+
+# Optionally ensure that httpx is installed.
+# Remove the following line if httpx is already in your requirements.txt.
+RUN pip install --no-cache-dir httpx
 
 # Download the spaCy model
 RUN python -m spacy download en_core_web_sm
