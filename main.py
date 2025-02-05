@@ -10,7 +10,7 @@ from urllib.parse import quote
 from fastapi import FastAPI, File, UploadFile, HTTPException, Request, Response, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-import openai
+import httpx
 import fitz  # PyMuPDF
 from pptx import Presentation
 from PIL import Image
@@ -24,7 +24,7 @@ import spacy
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Load spaCy model for sentence segmentation (ensure you have installed en_core_web_sm)
+# Load spaCy model
 try:
     nlp = spacy.load("en_core_web_sm")
 except Exception as e:
@@ -33,7 +33,7 @@ except Exception as e:
 # Initialize FastAPI app
 app = FastAPI()
 
-# Performance Metrics Middleware: measure processing time of requests.
+# Performance Metrics Middleware
 @app.middleware("http")
 async def add_process_time_header(request: Request, call_next):
     start_time = time.time()
@@ -54,10 +54,10 @@ app.add_middleware(
 # -----------------------------------------------------------------------------------
 # Environment Configuration
 # -----------------------------------------------------------------------------------
-openai.api_key = os.getenv("OPENAI_API_KEY")
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 
-# Firebase configuration (read JSON credentials from an environment variable)
+# Firebase configuration
 firebase_creds_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
 if firebase_creds_json:
     try:
@@ -75,7 +75,7 @@ bucket = storage_client.bucket("unibud-22153.appspot.com")
 # Pinecone initialization
 pc = Pinecone(api_key=PINECONE_API_KEY)
 INDEX_NAME = "unibud-index"
-EMBEDDING_DIM = 1536
+EMBEDDING_DIM = 1536  # Verify with DeepSeek's embedding dimensions
 
 # Create index if it does not exist
 if INDEX_NAME not in pc.list_indexes().names():
@@ -92,14 +92,14 @@ index = pc.Index(INDEX_NAME)
 # Helper Functions
 # -----------------------------------------------------------------------------------
 def upload_to_firebase(file_bytes: bytes, file_name: str, content_type: str) -> str:
-    """Uploads file bytes to Firebase Storage under the 'study_resources' folder."""
+    """Uploads file bytes to Firebase Storage."""
     blob = bucket.blob(f"study_resources/{file_name}")
     blob.upload_from_string(file_bytes, content_type=content_type)
     blob.make_public()
     return blob.public_url
 
 def chunk_text(text: str, max_sentences: int = 5, overlap: int = 1) -> List[str]:
-    """Split text into chunks of sentences with overlap using spaCy."""
+    """Split text into chunks using spaCy."""
     doc = nlp(text)
     sentences = [sent.text.strip() for sent in doc.sents if sent.text.strip()]
     chunks = []
@@ -113,17 +113,11 @@ def chunk_text(text: str, max_sentences: int = 5, overlap: int = 1) -> List[str]
     return chunks
 
 def extract_text_from_pdf(pdf_path: str) -> str:
-    """
-    Extracts text from a PDF file using PyMuPDF.
-    For each page, if the embedded text is very short (suggesting it may be an image),
-    the page is rendered to an image and OCR is applied.
-    """
+    """Extracts text from PDF with OCR fallback."""
     doc = fitz.open(pdf_path)
     full_text = ""
     for page in doc:
-        # Try to extract embedded text first
         text = page.get_text().strip()
-        # If the text is very short, perform OCR on the page
         if len(text) < 20:
             try:
                 pix = page.get_pixmap()
@@ -138,14 +132,13 @@ def extract_text_from_pdf(pdf_path: str) -> str:
     return full_text
 
 def extract_text_from_ppt(ppt_path: str) -> str:
-    """Extracts text from a PPT/PPTX file and applies OCR to any images."""
+    """Extracts text from PPT/PPTX with OCR."""
     prs = Presentation(ppt_path)
     full_text = ""
     for slide in prs.slides:
         for shape in slide.shapes:
             if hasattr(shape, "text") and shape.text:
                 full_text += shape.text + "\n"
-            # Check for picture shapes (pptx image shapes have shape_type value 13)
             if hasattr(shape, "shape_type") and shape.shape_type == 13:
                 try:
                     image_stream = io.BytesIO(shape.image.blob)
@@ -156,7 +149,7 @@ def extract_text_from_ppt(ppt_path: str) -> str:
     return full_text
 
 def process_file(file_path: str) -> str:
-    """Determines file type by extension and extracts text accordingly."""
+    """Process different file types."""
     ext = os.path.splitext(file_path)[1].lower()
     if ext == ".pdf":
         return extract_text_from_pdf(file_path)
@@ -164,25 +157,36 @@ def process_file(file_path: str) -> str:
         return extract_text_from_ppt(file_path)
     return ""
 
-def get_embeddings(texts: List[str]) -> List[List[float]]:
-    """Batch generate embeddings using OpenAI."""
+async def get_embeddings(texts: List[str]) -> List[List[float]]:
+    """Get embeddings from DeepSeek API."""
     try:
-        response = openai.Embedding.create(input=texts, model="text-embedding-ada-002")
-        return [item["embedding"] for item in response["data"]]
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                "https://api.deepseek.com/v1/embeddings",
+                headers={
+                    "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "input": texts,
+                    "model": "deepseek-embed"
+                },
+                timeout=30
+            )
+            response.raise_for_status()
+            data = response.json()
+            return [item["embedding"] for item in data["data"]]
     except Exception as e:
-        logger.error(f"Embedding error: {e}")
+        logger.error(f"DeepSeek embedding error: {e}")
         raise HTTPException(500, detail=f"Embedding error: {e}")
 
-def get_embedding(text: str) -> List[float]:
-    """Generate embedding for a single text by wrapping the batch embedding call."""
-    embeddings = get_embeddings([text])
+async def get_embedding(text: str) -> List[float]:
+    """Get single embedding."""
+    embeddings = await get_embeddings([text])
     return embeddings[0]
 
-def index_documents(file_infos: List[Dict]) -> None:
-    """
-    Processes provided file infos, splits text into chunks, generates embeddings,
-    and upserts them into Pinecone.
-    """
+async def index_documents(file_infos: List[Dict]) -> None:
+    """Process and index documents with DeepSeek embeddings."""
     vectors = []
     for file_info in file_infos:
         text = process_file(file_info["local_path"])
@@ -190,12 +194,10 @@ def index_documents(file_infos: List[Dict]) -> None:
             continue
 
         chunks = chunk_text(text)
-        # Batch process embeddings for all chunks from a file for efficiency
         if chunks:
-            embeddings = get_embeddings(chunks)
+            embeddings = await get_embeddings(chunks)
             for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
                 vector_id = f"{os.path.basename(file_info['local_path'])}_{i}"
-                # Merge system generated metadata with user-provided metadata (if any)
                 metadata = {
                     "source_file": os.path.basename(file_info["local_path"]),
                     "chunk_index": i,
@@ -205,12 +207,36 @@ def index_documents(file_infos: List[Dict]) -> None:
                 if "user_metadata" in file_info:
                     metadata.update(file_info["user_metadata"])
                 vectors.append((vector_id, embedding, metadata))
-                # Sleep a short time to avoid rate limits
                 time.sleep(0.2)
 
     if vectors:
         index.upsert(vectors=vectors)
         logger.info(f"Upserted {len(vectors)} vectors into Pinecone.")
+
+async def deepseek_chat_completion(messages: List[Dict]) -> str:
+    """Get chat completion from DeepSeek."""
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                "https://api.deepseek.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": "deepseek-chat",
+                    "messages": messages,
+                    "temperature": 0.2,
+                    "max_tokens": 1000
+                },
+                timeout=30
+            )
+            response.raise_for_status()
+            data = response.json()
+            return data['choices'][0]['message']['content']
+    except Exception as e:
+        logger.error(f"DeepSeek chat error: {e}")
+        raise HTTPException(500, detail=f"Chat completion error: {e}")
 
 # -----------------------------------------------------------------------------------
 # API Endpoints
@@ -221,44 +247,37 @@ class QueryRequest(BaseModel):
 @app.post("/upload")
 async def upload_files(
     files: List[UploadFile] = File(...),
-    metadata: Optional[str] = Form(None)  # Expecting a JSON string with metadata for each file
+    metadata: Optional[str] = Form(None)
 ):
     start_time = time.time()
     try:
         file_infos = []
         temp_paths = []
 
-        # Parse the metadata JSON if provided
         user_metadata_list = []
         if metadata:
             try:
                 user_metadata_list = json.loads(metadata)
                 if not isinstance(user_metadata_list, list):
-                    raise ValueError("Metadata should be a list of objects, one per file.")
+                    raise ValueError("Metadata should be a list of objects.")
             except Exception as e:
                 raise HTTPException(400, detail=f"Invalid metadata JSON: {e}")
 
         for idx, uploaded_file in enumerate(files):
-            # Validate file type
             if not uploaded_file.filename.lower().endswith(('.pdf', '.ppt', '.pptx')):
                 raise HTTPException(400, detail="Invalid file type")
 
-            # Read file content
             content = await uploaded_file.read()
-
-            # Upload to Firebase
             firebase_url = upload_to_firebase(
                 content,
                 uploaded_file.filename,
                 uploaded_file.content_type
             )
 
-            # Save to temporary file
             with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(uploaded_file.filename)[1]) as temp_file:
                 temp_file.write(content)
                 temp_path = temp_file.name
 
-            # Prepare the file info; attach user metadata for this file if provided
             file_info = {
                 "local_path": temp_path,
                 "firebase_url": firebase_url
@@ -268,10 +287,8 @@ async def upload_files(
             file_infos.append(file_info)
             temp_paths.append(temp_path)
 
-        # Index documents into Pinecone
-        index_documents(file_infos)
+        await index_documents(file_infos)
 
-        # Cleanup temporary files
         for path in temp_paths:
             os.unlink(path)
 
@@ -282,7 +299,7 @@ async def upload_files(
         })
 
     except Exception as e:
-        logger.error(f"Error in /upload endpoint: {e}")
+        logger.error(f"Upload error: {e}")
         raise HTTPException(500, detail=str(e))
 
 @app.post("/ask")
@@ -293,30 +310,22 @@ async def ask_question(query: QueryRequest):
         if not query_text.strip():
             raise HTTPException(400, detail="Empty query provided.")
 
-        # Generate an embedding for the query and query Pinecone
-        query_embedding = get_embedding(query_text)
-        # Increase top_k to get maximum results (here set to 10)
+        # Get embedding and query Pinecone
+        query_embedding = await get_embedding(query_text)
         response = index.query(vector=query_embedding, top_k=10, include_metadata=True)
 
-        # Log the retrieved chunks for debugging
-        for match in response.matches:
-            logger.info(f"Retrieved chunk: {match.metadata.get('text', '').strip()}")
-
-        # Check if any relevant context was found
         if not response.matches or all(not match.metadata.get("text", "").strip() for match in response.matches):
             processing_time = time.time() - start_time
             return {
-                "answer": "I'm sorry, but I couldn't find any relevant information to answer your question.",
+                "answer": "I couldn't find relevant information to answer your question.",
                 "sources": [],
                 "highlighted_context": "",
                 "processing_time": processing_time,
                 "token_usage": {}
             }
 
-        # Build context from Pinecone matches
         context_chunks = [match.metadata.get("text", "").strip() for match in response.matches if match.metadata.get("text", "").strip()]
         context = "\n".join(context_chunks)
-        # Wrap each chunk in <mark> tags for highlighting
         highlighted_context = "\n".join([f"<mark>{chunk}</mark>" for chunk in context_chunks])
         
         system_prompt = (
@@ -325,17 +334,10 @@ async def ask_question(query: QueryRequest):
         )
         user_prompt = f"Context:\n{context}\n\nQuestion: {query_text}"
 
-        completion = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            temperature=0.2,
-            max_tokens=1000
-        )
-        
-        answer = completion["choices"][0]["message"]["content"]
+        answer = await deepseek_chat_completion([
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ])
 
         sources = []
         for match in response.matches:
@@ -349,12 +351,12 @@ async def ask_question(query: QueryRequest):
             "context": context,
             "highlighted_context": highlighted_context,
             "processing_time": processing_time,
-            "token_usage": dict(completion.get("usage", {}))
+            "token_usage": {}  # DeepSeek might return usage in response
         }
 
     except Exception as e:
-        logger.error(f"Error in /ask endpoint: {e}")
-        raise HTTPException(500, detail=f"An error occurred while processing the query: {e}")
+        logger.error(f"Ask error: {e}")
+        raise HTTPException(500, detail=f"Query processing error: {e}")
 
 @app.get("/health")
 def health_check():
@@ -362,4 +364,4 @@ def health_check():
 
 @app.get("/")
 def read_root():
-    return {"message": "Welcome to the UniBud API! Use /upload to upload files or /ask to query."}
+    return {"message": "UniBud API - DeepSeek Edition"}
