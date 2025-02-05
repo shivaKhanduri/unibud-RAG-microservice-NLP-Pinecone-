@@ -11,8 +11,7 @@ from urllib.parse import quote
 from fastapi import FastAPI, File, UploadFile, HTTPException, Request, Response, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-import openai  # <-- Using openai client for chat completions
-import httpx
+import openai
 import fitz  # PyMuPDF
 from pptx import Presentation
 from PIL import Image
@@ -64,8 +63,7 @@ app.add_middleware(
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 
-# Configure openai to point to DeepSeek
-# (DeepSeek's OpenAI-compatible base URL)
+# Configure OpenAI to point to DeepSeek's OpenAI-compatible endpoint
 openai.api_key = DEEPSEEK_API_KEY
 openai.api_base = "https://api.deepseek.com"
 
@@ -172,33 +170,41 @@ def process_file(file_path: str) -> str:
     return ""
 
 # ------------------------------------------------------------------------------
-# Embeddings with httpx (if you still need them)
+# Embedding (OpenAI client pointed at DeepSeek)
 # ------------------------------------------------------------------------------
-async def get_embeddings(texts: List[str]) -> List[List[float]]:
+def openai_embedding_sync(texts: List[str], model: str = "text-embedding-002") -> List[List[float]]:
+    """
+    Calls the OpenAI Embedding API (DeepSeek endpoint) synchronously.
+    Returns a list of embedding vectors (one per text).
+    """
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                "https://api.deepseek.com/v1/embeddings",  # Added /v1
-                headers={
-                    "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "input": texts,
-                    "model": "text-embedding-002"  # Verify model name
-                },
-                timeout=30
-            )
-            response.raise_for_status()
-            data = response.json()
-            
-            return [item["embedding"] for item in data["data"]]
+        response = openai.Embedding.create(
+            model=model,
+            input=texts
+        )
+        # Typically returns {'data': [{'embedding': [...], 'index': 0}, ...], ...}
+        embeddings = []
+        for item in response["data"]:
+            embeddings.append(item["embedding"])
+        return embeddings
     except Exception as e:
         logger.error(f"DeepSeek embedding error: {e}")
         raise HTTPException(500, detail=f"Embedding error: {e}")
 
+async def get_embeddings(texts: List[str]) -> List[List[float]]:
+    """
+    Asynchronous wrapper that uses run_in_executor to avoid blocking the event loop.
+    """
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        None,
+        lambda: openai_embedding_sync(texts, model="text-embedding-002")
+    )
+
 async def get_embedding(text: str) -> List[float]:
-    """Convenience method for a single embedding."""
+    """
+    Convenience method for a single embedding (still uses the async wrapper).
+    """
     embeddings = await get_embeddings([text])
     return embeddings[0]
 
@@ -247,7 +253,9 @@ async def index_documents(file_infos: List[Dict]) -> None:
                 if "user_metadata" in file_info:
                     metadata.update(file_info["user_metadata"])
                 vectors.append((vector_id, embedding, metadata))
-                await asyncio.sleep(0.2)  # non-blocking sleep
+
+                # non-blocking sleep
+                await asyncio.sleep(0.2)
 
     if vectors:
         index.upsert(vectors=vectors)
@@ -325,7 +333,7 @@ async def upload_files(
 async def ask_question(query: QueryRequest):
     """
     Asks a question:
-      1. Gets an embedding of the query.
+      1. Gets an embedding of the query (via openai embedding -> DeepSeek).
       2. Queries Pinecone for context.
       3. Calls the DeepSeek chat model (via openai client) to form an answer.
     """
@@ -335,7 +343,7 @@ async def ask_question(query: QueryRequest):
         if not query_text:
             raise HTTPException(400, detail="Empty query provided.")
 
-        # 1. Get embedding from DeepSeek
+        # 1. Get embedding from DeepSeek (OpenAI wrapper)
         query_embedding = await get_embedding(query_text)
 
         # 2. Query Pinecone
