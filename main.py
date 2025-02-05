@@ -175,23 +175,23 @@ def process_file(file_path: str) -> str:
 # Embeddings with httpx (if you still need them)
 # ------------------------------------------------------------------------------
 async def get_embeddings(texts: List[str]) -> List[List[float]]:
-    """Get embeddings from the DeepSeek embedding endpoint using httpx."""
     try:
         async with httpx.AsyncClient() as client:
             response = await client.post(
-                "https://api.deepseek.com/embeddings",
+                "https://api.deepseek.com/v1/embeddings",  # Added /v1
                 headers={
                     "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
                     "Content-Type": "application/json"
                 },
                 json={
                     "input": texts,
-                    "model": "deepseek-embed"  # or "text-embedding-002" per doc
+                    "model": "text-embedding-002"  # Verify model name
                 },
                 timeout=30
             )
             response.raise_for_status()
             data = response.json()
+            
             return [item["embedding"] for item in data["data"]]
     except Exception as e:
         logger.error(f"DeepSeek embedding error: {e}")
