@@ -59,6 +59,12 @@ DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 DEEPSEEK_BASE_URL = "https://api.deepseek.ai"
 
+headers={
+    "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+    "Content-Type": "application/json",
+    "Accept": "application/json"  # Required for some APIs
+}
+
 # Firebase configuration
 firebase_creds_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
 if firebase_creds_json:
