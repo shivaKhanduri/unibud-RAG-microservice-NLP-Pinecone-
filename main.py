@@ -4,6 +4,7 @@ import json
 import time
 import tempfile
 import logging
+import asyncio  # Added for non-blocking sleep
 from typing import List, Dict, Optional
 from urllib.parse import quote
 
@@ -162,7 +163,7 @@ async def get_embeddings(texts: List[str]) -> List[List[float]]:
     try:
         async with httpx.AsyncClient() as client:
             response = await client.post(
-                "https://api.deepseek.com/embeddings",
+                "https://api.deepseek.com/v1/embeddings",  # Updated to include /v1
                 headers={
                     "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
                     "Content-Type": "application/json"
@@ -207,7 +208,7 @@ async def index_documents(file_infos: List[Dict]) -> None:
                 if "user_metadata" in file_info:
                     metadata.update(file_info["user_metadata"])
                 vectors.append((vector_id, embedding, metadata))
-                time.sleep(0.2)
+                await asyncio.sleep(0.2)  # Non-blocking sleep
 
     if vectors:
         index.upsert(vectors=vectors)
@@ -218,7 +219,7 @@ async def deepseek_chat_completion(messages: List[Dict]) -> str:
     try:
         async with httpx.AsyncClient() as client:
             response = await client.post(
-                "https://api.deepseek.com/chat/completions",
+                "https://api.deepseek.com/v1/chat/completions",  # Updated to include /v1
                 headers={
                     "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
                     "Content-Type": "application/json"
